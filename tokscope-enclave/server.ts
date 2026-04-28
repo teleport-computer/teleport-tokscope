@@ -1897,6 +1897,13 @@ appAuth.get('/containers', async (req, res) => {
  * - Executes signed request to TikTok
  * - Returns response (public video metadata)
  */
+// v1.2.1.1.9 T1: TEE-side inbound concurrency cap. Symmetric safety-net to
+// xordi-api's outbound semaphore. Bounds in-flight handlers so the Node event
+// loop doesn't fill with stuck requests under multi-instance / cold-cache load.
+// Counter is per-process; only the data-customer process serves /api/tiktok/execute.
+const TEE_INBOUND_LIMIT = parseInt(process.env.TEE_INBOUND_CONCURRENCY_LIMIT || '20', 10);
+let inflight = 0;
+
 appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
   try {
     const { sec_user_id, wireguard_bucket, ipfoxy_session, request } = req.body;
@@ -1909,6 +1916,36 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       return res.status(401).json({ error: 'Invalid API key' });
     }
 
+    // ── v1.2.1.1.9 T1: inbound concurrency cap, fail-fast ───────────────────
+    // Placed AFTER auth check (so bad keys don't consume slots) and BEFORE
+    // the cookie-fetch + crypto work (so a slot is held only during real work).
+    if (inflight >= TEE_INBOUND_LIMIT) {
+      // Jittered retry-after to prevent thundering-herd on recovery.
+      // Without jitter, every client 503'd in the same instant retries
+      // simultaneously N seconds later, re-saturating the cap and amplifying
+      // the burst pattern. 30-60s spread lets clients arrive over a 30s
+      // window so the TEE drains naturally between waves.
+      // Math.random() is fine here — non-security-sensitive, just spread.
+      const retryAfter = 30 + Math.floor(Math.random() * 30);
+      return res.status(503).json({
+        error: 'tee_busy',
+        message: 'TEE inbound concurrency limit reached',
+        retryable: true,
+        retry_after_seconds: retryAfter,
+      });
+    }
+    inflight++;
+
+    // ── v1.2.1.1.9 T2-min: cancellation propagation ─────────────────────────
+    // When xordi-api gives up at its 45s outer axios timeout, it sends FIN.
+    // req.on('close') fires; we abort the AbortController; in-flight axios
+    // calls below see signal.aborted and throw CanceledError, freeing the slot.
+    const ac = new AbortController();
+    req.on('close', () => {
+      if (!res.writableEnded) ac.abort();
+    });
+
+    try {
     // 2. Validate endpoint against whitelist (Trust Enforcement)
     const ALLOWED_ENDPOINTS = {
       read_only: [
@@ -1970,7 +2007,16 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
           {
             headers: {
               'X-Api-Key': xordiApiKey
-            }
+            },
+            // v1.2.1.1.9 T2-min: propagate xordi-api abort to TEE-side cookie fetch.
+            signal: ac.signal,
+            // v1.2.1.1.9 T2-min Fix-1: explicit fail-fast timeout. Cookie fetch is a
+            // single SELECT against tiktok_users; <100ms in practice. 15s is well
+            // above legitimate variance, well below downstream bounds (xordi pool
+            // 10s connect + 30s statement = 40s worst case; Phala gateway kill
+            // ~43s; signal fires when xordi-api outer axios gives up at 45s).
+            // Belt-and-suspenders against AUTH-FAILURE-ROOT-CAUSE.md RC#1.
+            timeout: 15000
           }
         );
 
@@ -2164,6 +2210,9 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       axiosConfig.params = request.params;
     }
 
+    // v1.2.1.1.9 T2-min: propagate xordi-api abort to TikTok call.
+    // axiosConfig already has timeout: 15000; just add signal for cooperative abort.
+    axiosConfig.signal = ac.signal;
     const tiktokResponse = await axios.request(axiosConfig);
     const responseData = tiktokResponse.data;
 
@@ -2218,6 +2267,13 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
     }
     // Default: return plaintext (normal path, or dev fallback when no DStack)
     res.json(tiktokResponse.data);
+
+    } finally {
+      // v1.2.1.1.9 T1: release the inbound slot. Fires on every body exit path
+      // (success / 4xx / 5xx return / thrown error → outer catch). Integer
+      // decrement is event-loop-atomic; cannot throw.
+      inflight--;
+    }
 
   } catch (error: any) {
     // v1.2.1.1.3 — capture safe diagnostic fields so we can distinguish where
