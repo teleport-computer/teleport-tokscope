@@ -1937,13 +1937,21 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
     inflight++;
 
     // ── v1.2.1.1.9 T2-min: cancellation propagation ─────────────────────────
-    // When xordi-api gives up at its 45s outer axios timeout, it sends FIN.
-    // req.on('close') fires; we abort the AbortController; in-flight axios
-    // calls below see signal.aborted and throw CanceledError, freeing the slot.
+    // v1.2.1.1.10 HOTFIX (2026-04-28): the original v1.2.1.1.9 plumbing was:
+    //   req.on('close', () => { if (!res.writableEnded) ac.abort(); });
+    // That fired prematurely on Express POSTs because IncomingMessage emits
+    // 'close' once the request body stream is fully consumed by body-parsers,
+    // BEFORE the response is sent. Result: every cookie axios.get aborted with
+    // CanceledError ("canceled" in TEE logs), every /api/tiktok/execute returned
+    // 500 'Failed to retrieve session data', watch_history at 0%.
+    //
+    // For now: keep the AbortController declaration (so signal: ac.signal stays
+    // valid in the axios calls below — passing a never-aborted signal is a no-op
+    // for axios). The cancellation feature is gone until we re-design with the
+    // right event (likely res.on('close') with !writableEnded guard, but that
+    // needs a verification cycle in this exact Node 18.20.8 / Express 4 / Phala
+    // gateway stack before re-enabling).
     const ac = new AbortController();
-    req.on('close', () => {
-      if (!res.writableEnded) ac.abort();
-    });
 
     try {
     // 2. Validate endpoint against whitelist (Trust Enforcement)
