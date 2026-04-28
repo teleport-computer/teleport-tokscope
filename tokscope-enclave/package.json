@@ -13,7 +13,7 @@
     "playwright": "1.41.0",
     "@phala/dstack-sdk": "0.5.4",
     "viem": "2.7.0",
-    "axios": "1.10.0",
+    "axios": "1.15.2",
     "@typescript-eslint/parser": "8.44.0",
     "jsqr": "1.4.0",
     "jimp": "1.6.0",
@@ -29,5 +29,7 @@
   "engines": {
     "node": ">=18"
   },
-  "overrides": {}
+  "overrides": {
+    "axios": "1.15.2"
+  }
 }

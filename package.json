@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "@octokit/rest": "^21.0.2",
-    "axios": "^1.10.0",
+    "axios": "1.15.2",
     "dockerode": "^4.0.2",
     "express": "^4.18.2",
     "jimp": "^1.6.0",
@@ -43,5 +43,8 @@
   "license": "MIT",
   "engines": {
     "node": ">=16.0.0"
+  },
+  "overrides": {
+    "axios": "1.15.2"
   }
 }
