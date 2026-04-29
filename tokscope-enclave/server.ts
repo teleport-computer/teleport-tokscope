@@ -377,6 +377,24 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
           }
         }
       }
+
+      // v1.2.1.1.11 P1: log all tiktok.com responses (URL + status, no body)
+      // for diagnosing why the QR-scan flow stalls. Skips static assets.
+      const url = response.url();
+      if (url.includes('tiktok.com') &&
+          !/\.(css|js|png|jpg|jpeg|gif|woff2?|svg|ico|map)(\?|$)/i.test(url)) {
+        console.log(`📡 [resp] ${response.status()} ${response.request().method()} ${url.substring(0, 140)}`);
+      }
+
+      // v1.2.1.1.11 P3: log non-AUTH Set-Cookie event cookie NAMES (no values)
+      // so we can see what TikTok IS setting if it's not the four we're listening for.
+      for (const cookieStr of setCookies) {
+        const cookieName = cookieStr.split('=')[0];
+        if (!AUTH_COOKIES.includes(cookieName) && !seenCookies.has(`other:${cookieName}`)) {
+          seenCookies.add(`other:${cookieName}`);
+          console.log(`🍪 [+other] ${cookieName}`);
+        }
+      }
     } catch (e) { /* response may be closed */ }
   });
 
@@ -1276,6 +1294,15 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         const warningStr = lastWarnings.size > 0 ? ` [${[...lastWarnings].join(', ')}]` : '';
         console.log(`💓 Auth ${authSessionId.substring(0, 8)} waiting... (${elapsed}s, ${arrivedCookies.size}/6 cookies, ${cookies.length} total)${warningStr}`);
         console.log(`   URL: ${baseUrl}`);
+
+        // v1.2.1.1.11 P2: fire-and-forget screenshot at each heartbeat. The
+        // browser is alive here (we just read baseUrl from it). qr_visible
+        // captures pre-scan only; timeout_no_cookies fails because the browser
+        // is destroyed before capture. This fills the gap.
+        captureDebugScreenshot(page, authSessionId, `heartbeat_${elapsed}s`).catch(() => {
+          /* screenshot failure shouldn't break the auth flow */
+        });
+
         lastHeartbeat = Date.now();
       }
 
