@@ -1294,15 +1294,6 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         const warningStr = lastWarnings.size > 0 ? ` [${[...lastWarnings].join(', ')}]` : '';
         console.log(`💓 Auth ${authSessionId.substring(0, 8)} waiting... (${elapsed}s, ${arrivedCookies.size}/6 cookies, ${cookies.length} total)${warningStr}`);
         console.log(`   URL: ${baseUrl}`);
-
-        // v1.2.1.1.11 P2: fire-and-forget screenshot at each heartbeat. The
-        // browser is alive here (we just read baseUrl from it). qr_visible
-        // captures pre-scan only; timeout_no_cookies fails because the browser
-        // is destroyed before capture. This fills the gap.
-        captureDebugScreenshot(page, authSessionId, `heartbeat_${elapsed}s`).catch(() => {
-          /* screenshot failure shouldn't break the auth flow */
-        });
-
         lastHeartbeat = Date.now();
       }
 
