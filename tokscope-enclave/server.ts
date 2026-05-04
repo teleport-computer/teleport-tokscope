@@ -7,6 +7,7 @@ import jsQR from 'jsqr';
 import { log } from './lib/log';
 import { tryAcquireInbound, releaseInbound } from './lib/inbound-semaphore';
 import { initDStack, getEncryptionKey, getDstackSDK } from './lib/tee-init';
+import { AuthSessionManager, AuthSession } from './lib/auth-session-manager';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -100,20 +101,8 @@ interface Config {
   };
 }
 
-interface AuthSession {
-  authSessionId: string;
-  sessionId: string;
-  browser: Browser | null;
-  page: Page | null;
-  containerId: string | null;
-  status: 'awaiting_scan' | 'complete' | 'failed';
-  qrCodeData: string | null;
-  qrDecodedUrl?: string | null;  // Magic link URL
-  sessionData: SessionData | null;
-  startedAt: number;
-  timeoutMs: number;  // v1.1.3login: per-session timeout (QR=AUTH_TIMEOUT_MS, portal=portalTimeoutMs)
-  portalSessionUrl?: string | null;  // v1.1.3login: session-token portal URL for WebRTC access
-}
+// v2.5 phase-2 step-4: AuthSession interface moved to
+// lib/auth-session-manager.ts. Imported above.
 
 // v3-s: Debug screenshot storage (in-memory with TTL)
 interface DebugScreenshot {
@@ -191,81 +180,11 @@ async function captureDebugScreenshot(
   }
 }
 
-class AuthSessionManager {
-  private authSessions = new Map<string, AuthSession>();
-  private readonly AUTH_TIMEOUT_MS = 120000; // 2 minutes
-
-  generateAuthSessionId(): string {
-    return crypto.randomUUID();
-  }
-
-  createAuthSession(sessionId: string, timeoutMs?: number): string {
-    const authSessionId = this.generateAuthSessionId();
-    this.authSessions.set(authSessionId, {
-      authSessionId,
-      sessionId,
-      browser: null,
-      page: null,
-      containerId: null,
-      status: 'awaiting_scan',
-      qrCodeData: null,
-      sessionData: null,
-      startedAt: Date.now(),
-      // v1.1.3login: per-session timeout — QR sessions use AUTH_TIMEOUT_MS, portal sessions use portalTimeoutMs
-      timeoutMs: timeoutMs !== undefined ? timeoutMs : this.AUTH_TIMEOUT_MS,
-      portalSessionUrl: null
-    });
-    return authSessionId;
-  }
-
-  getAuthSession(authSessionId: string): AuthSession | null {
-    return this.authSessions.get(authSessionId) || null;
-  }
-
-  updateAuthSession(authSessionId: string, updates: Partial<AuthSession>): void {
-    const session = this.authSessions.get(authSessionId);
-    if (session) {
-      Object.assign(session, updates);
-    }
-  }
-
-  removeAuthSession(authSessionId: string): void {
-    this.authSessions.delete(authSessionId);
-    authScreenshotSteps.delete(authSessionId);
-  }
-
-  async cleanupExpired(): Promise<void> {
-    const now = Date.now();
-    const expired: string[] = [];
-
-    for (const [authSessionId, session] of this.authSessions.entries()) {
-      // v1.1.3login: use per-session timeout (QR=AUTH_TIMEOUT_MS, portal=portalTimeoutMs)
-      const sessionTimeoutMs = session.timeoutMs !== undefined ? session.timeoutMs : this.AUTH_TIMEOUT_MS;
-      if (now - session.startedAt > sessionTimeoutMs) {
-        expired.push(authSessionId);
-      }
-    }
-
-    for (const authSessionId of expired) {
-      console.log(`🧹 Cleaning up expired auth session: ${authSessionId.substring(0, 8)}...`);
-      log.ok('AUTH', 'session_expired', { session: authSessionId.substring(0, 8) });
-
-      // CRITICAL: Release the browser container BEFORE removing session
-      try {
-        await destroyAuthContainer(authSessionId);
-        console.log(`✅ Released container for expired session ${authSessionId.substring(0, 8)}...`);
-      } catch (e) {
-        console.error(`⚠️ Failed to release container for ${authSessionId}:`, e);
-      }
-
-      this.removeAuthSession(authSessionId);
-    }
-
-    if (expired.length > 0) {
-      console.log(`🧹 Cleaned up ${expired.length} expired sessions`);
-    }
-  }
-}
+// v2.5 phase-2 step-4: AuthSessionManager class moved to
+// lib/auth-session-manager.ts. Construction site below passes
+// destroyAuthContainer as a callback dependency, and listens to
+// 'session_removed' to clean up authScreenshotSteps (which used
+// to be done inline in removeAuthSession).
 
 /**
  * v3-v: Request browser instance - NOW CREATES THE ONLY CDP CONNECTION
@@ -3201,7 +3120,16 @@ async function startServer(): Promise<void> {
     sessionManager = new SessionManager();
     sessionManager.initialize();
 
-    authSessionManager = new AuthSessionManager();
+    authSessionManager = new AuthSessionManager({
+      // Pass destroyAuthContainer as a callback — the lib doesn't
+      // know about browser-manager URLs; server.ts owns that.
+      destroyContainer: destroyAuthContainer
+    });
+    // Auxiliary cleanup that used to be inline in removeAuthSession:
+    // when a session is removed, drop its screenshot-step counter too.
+    authSessionManager.on('session_removed', (authSessionId: string) => {
+      authScreenshotSteps.delete(authSessionId);
+    });
     console.log('🔐 Auth session manager initialized');
 
     moduleLoader = new EnclaveModuleLoader();
