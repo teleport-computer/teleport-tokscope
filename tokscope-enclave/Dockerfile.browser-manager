@@ -31,8 +31,10 @@ RUN mkdir -p /npm-cache && \
     rm -rf /npm-cache
 
 # Copy TypeScript source files
+# Two lib roots get merged into /app/lib/ (see Dockerfile.api for rationale).
 COPY tokscope-enclave/*.ts ./
 COPY lib/ ./lib/
+COPY tokscope-enclave/lib/*.ts ./lib/
 COPY tokscope-enclave/tsconfig.json ./tsconfig.json
 
 # Build TypeScript to JavaScript

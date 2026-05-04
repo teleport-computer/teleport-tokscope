@@ -30,8 +30,15 @@ RUN mkdir -p /npm-cache && \
     rm -rf /npm-cache
 
 # Copy TypeScript source files
+# Two lib roots get merged into /app/lib/:
+#   - top-level lib/ (shared with teleport-tokscope CLI tools)
+#   - tokscope-enclave/lib/ (enclave-server-specific, e.g. v2.5 sse-channel,
+#     auth-session-manager, inbound-semaphore, tee-init, scan-watcher).
+# server.ts imports `./lib/<x>` which after this flattening resolves to
+# /app/lib/<x>.ts regardless of which source root the file came from.
 COPY tokscope-enclave/*.ts ./
 COPY lib/ ./lib/
+COPY tokscope-enclave/lib/*.ts ./lib/
 COPY tokscope-enclave/tsconfig.json ./tsconfig.json
 
 # Build TypeScript to JavaScript
