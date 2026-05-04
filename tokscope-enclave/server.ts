@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import jsQR from 'jsqr';
 import { log } from './lib/log';
+import { tryAcquireInbound, releaseInbound } from './lib/inbound-semaphore';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -1915,12 +1916,10 @@ appAuth.get('/containers', async (req, res) => {
  * - Executes signed request to TikTok
  * - Returns response (public video metadata)
  */
-// v1.2.1.1.9 T1: TEE-side inbound concurrency cap. Symmetric safety-net to
-// xordi-api's outbound semaphore. Bounds in-flight handlers so the Node event
-// loop doesn't fill with stuck requests under multi-instance / cold-cache load.
-// Counter is per-process; only the data-customer process serves /api/tiktok/execute.
-const TEE_INBOUND_LIMIT = parseInt(process.env.TEE_INBOUND_CONCURRENCY_LIMIT || '20', 10);
-let inflight = 0;
+// v1.2.1.1.9 T1 / v2.5 phase-2 step-1: TEE-side inbound concurrency cap.
+// Symmetric safety-net to xordi-api's outbound semaphore. Implementation
+// extracted to lib/inbound-semaphore.ts; this file just calls
+// tryAcquireInbound / releaseInbound.
 
 appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
   try {
@@ -1937,22 +1936,15 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
     // ── v1.2.1.1.9 T1: inbound concurrency cap, fail-fast ───────────────────
     // Placed AFTER auth check (so bad keys don't consume slots) and BEFORE
     // the cookie-fetch + crypto work (so a slot is held only during real work).
-    if (inflight >= TEE_INBOUND_LIMIT) {
-      // Jittered retry-after to prevent thundering-herd on recovery.
-      // Without jitter, every client 503'd in the same instant retries
-      // simultaneously N seconds later, re-saturating the cap and amplifying
-      // the burst pattern. 30-60s spread lets clients arrive over a 30s
-      // window so the TEE drains naturally between waves.
-      // Math.random() is fine here — non-security-sensitive, just spread.
-      const retryAfter = 30 + Math.floor(Math.random() * 30);
+    const acquireResult = tryAcquireInbound();
+    if (!acquireResult.acquired) {
       return res.status(503).json({
         error: 'tee_busy',
         message: 'TEE inbound concurrency limit reached',
         retryable: true,
-        retry_after_seconds: retryAfter,
+        retry_after_seconds: acquireResult.retryAfterSeconds,
       });
     }
-    inflight++;
 
     // ── v1.2.1.1.9 T2-min: cancellation propagation ─────────────────────────
     // v1.2.1.1.10 HOTFIX (2026-04-28): the original v1.2.1.1.9 plumbing was:
@@ -2298,7 +2290,7 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       // v1.2.1.1.9 T1: release the inbound slot. Fires on every body exit path
       // (success / 4xx / 5xx return / thrown error → outer catch). Integer
       // decrement is event-loop-atomic; cannot throw.
-      inflight--;
+      releaseInbound();
     }
 
   } catch (error: any) {
