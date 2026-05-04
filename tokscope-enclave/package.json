@@ -6,7 +6,9 @@
     "build": "tsc",
     "dev": "tsc && node dist/server.js",
     "dev:local": "node ../dist/server.js",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "start:auth": "node dist/server-auth.js",
+    "start:data": "node dist/server-data.js"
   },
   "dependencies": {
     "express": "4.18.2",
