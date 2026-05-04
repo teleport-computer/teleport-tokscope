@@ -6,6 +6,7 @@ import * as net from 'net';
 import jsQR from 'jsqr';
 import { log } from './lib/log';
 import { tryAcquireInbound, releaseInbound } from './lib/inbound-semaphore';
+import { initDStack, getEncryptionKey, getDstackSDK } from './lib/tee-init';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -535,8 +536,8 @@ const appDataBulk: typeof app = (isDataBulk ? app : noopApp) as any;
 
 let browser: Browser | null = null;
 let page: Page | null = null;
-let dstackSDK: any = null;
-let encryptionKey: Buffer | null = null;
+// v2.5 phase-2 step-2: dstackSDK + encryptionKey moved to lib/tee-init.ts.
+// Read via getDstackSDK() / getEncryptionKey().
 let lastKnownGatewayUrl: string = ''; // Set from borgcube's gatewayUrl in portal requests
 let sessionManager: SessionManager | null = null;
 let authSessionManager: AuthSessionManager | null = null;
@@ -624,43 +625,12 @@ setInterval(() => {
   }
 }, 60000);
 
-async function initDStack(): Promise<void> {
-  try {
-    const { DstackClient } = require('@phala/dstack-sdk');
-    const client = new DstackClient();
-
-    // Session encryption key
-    const sessionKeyResult = await client.getKey('session-encryption', 'aes');
-    encryptionKey = Buffer.from(sessionKeyResult.key).slice(0, 32);
-
-    // Cookie encryption key (separate derivation path = separate key)
-    const cookieKeyResult = await client.getKey('cookie-encryption', 'aes');
-    const cookieKey = Buffer.from(cookieKeyResult.key).slice(0, 32);
-    teeCrypto.setDStackKey(cookieKey);
-
-    // Watch history encryption key (SEPARATE derivation path — never shares key with cookies)
-    const watchHistoryKeyResult = await client.getKey('watch-history-encryption', 'aes');
-    const watchHistoryKey = Buffer.from(watchHistoryKeyResult.key).slice(0, 32);
-    teeCrypto.setDStackWatchHistoryKey(watchHistoryKey);
-
-    // v1.1.9: block until the crypto worker pool has acknowledged the key.
-    // This guarantees the HTTP server never answers a request before the
-    // pool is ready — no race between startup and first scrape.
-    await teeCrypto.waitForWorkersReady();
-
-    // Keep reference for /health endpoint
-    dstackSDK = client;
-
-    console.log('✅ DStack initialized, using TEE-derived keys for sessions + cookies + watch-history');
-  } catch (error: any) {
-    console.log('⚠️ DStack unavailable, using fallback encryption keys:', error.message);
-    const seed = 'tcb-session-encryption-fallback-seed-12345';
-    encryptionKey = crypto.createHash('sha256').update(seed).digest();
-    // tee-crypto.js keeps its constructor fallback key
-  }
-}
+// v2.5 phase-2 step-2: initDStack moved to lib/tee-init.ts. Imported above.
+// Both server-auth.ts and server-data.ts (when this file splits in step 3)
+// will share that same init path.
 
 function encryptSessionData(data: SessionData): string {
+  const encryptionKey = getEncryptionKey();
   if (!encryptionKey) throw new Error('Encryption key not initialized');
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-cbc', encryptionKey, iv);
@@ -673,6 +643,7 @@ function encryptSessionData(data: SessionData): string {
 }
 
 function decryptSessionData(encryptedData: any): SessionData {
+  const encryptionKey = getEncryptionKey();
   if (!encryptionKey) throw new Error('Encryption key not initialized');
 
   const { encrypted, iv, authTag, userId } = encryptedData;
@@ -3141,9 +3112,9 @@ app.get('/health', async (req, res) => {
     instance_id: process.env.INSTANCE_ID || 'main',
     uptime: (Date.now() - startTime) / 1000,
     sessions: sessionManager?.getSessionCount() || 0,
-    dstack: !!dstackSDK,
-    dstackInitialized: !!dstackSDK,
-    encryption: !!encryptionKey,
+    dstack: !!getDstackSDK(),
+    dstackInitialized: !!getDstackSDK(),
+    encryption: !!getEncryptionKey(),
     cookieEncryption: teeCrypto.isDStackKey() ? 'dstack' : 'fallback',
     watchHistoryEncryption: teeCrypto.isWatchHistoryKeyReady() ? 'dstack' : 'unavailable',
     timestamp: new Date().toISOString()
@@ -3189,6 +3160,7 @@ app.get('/ready', async (req, res) => {
 // TEE identity + attestation data (public — no auth required)
 app.get('/tee-info', async (req, res) => {
   try {
+    const dstackSDK = getDstackSDK();
     if (!dstackSDK) {
       return res.status(503).json({ error: 'DStack not initialized' });
     }
