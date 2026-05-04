@@ -8,6 +8,7 @@ import { log } from './lib/log';
 import { tryAcquireInbound, releaseInbound } from './lib/inbound-semaphore';
 import { initDStack, getEncryptionKey, getDstackSDK } from './lib/tee-init';
 import { AuthSessionManager, AuthSession } from './lib/auth-session-manager';
+import { registerSseChannel } from './lib/sse-channel';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -3130,6 +3131,15 @@ async function startServer(): Promise<void> {
     authSessionManager.on('session_removed', (authSessionId: string) => {
       authScreenshotSteps.delete(authSessionId);
     });
+
+    // v2.5 phase-3 step-1: register the SSE event-stream endpoint.
+    // Subscribes to AuthSessionManager events for a given authSessionId
+    // and pushes them to the connected client. Today no auth-flow code
+    // emits qr_ready / scan_detected / auth_complete / failed yet —
+    // those wires get added in step 2. The endpoint is harmless until
+    // emits arrive (just streams nothing).
+    registerSseChannel(appAuth, authSessionManager);
+
     console.log('🔐 Auth session manager initialized');
 
     moduleLoader = new EnclaveModuleLoader();
