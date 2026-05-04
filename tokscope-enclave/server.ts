@@ -9,6 +9,7 @@ import { tryAcquireInbound, releaseInbound } from './lib/inbound-semaphore';
 import { initDStack, getEncryptionKey, getDstackSDK } from './lib/tee-init';
 import { AuthSessionManager, AuthSession } from './lib/auth-session-manager';
 import { registerSseChannel } from './lib/sse-channel';
+import { attachScanWatcher } from './lib/scan-watcher';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -928,6 +929,20 @@ appAuth.post('/auth/start/:sessionId', async (req, res) => {
           console.log(`⚠️ QR extraction warning: ${qrData.error}`);
           await captureDebugScreenshot(authPage, authSessionId, 'qr_extraction_error');
         }
+
+        // v2.5 phase-3 step-3: attach the in-page scan-watcher so we
+        // get an early 'scan_detected' SSE event the moment TikTok
+        // renders its "scanned, confirm on phone" indicator. The
+        // watcher's selector candidates are placeholders; the real
+        // selector gets discovered during Phase 4 PROD2 iteration via
+        // debug-access DOM diff (see Scan-signal discovery section).
+        // If the watcher fails to attach OR the placeholders don't
+        // match the real DOM, auth still completes via URL detection
+        // inside waitForLoginCompletion — this is a UX/telemetry win,
+        // not a correctness gate.
+        await attachScanWatcher(authPage, () => {
+          authSessionManager!.emitScanDetected(authSessionId);
+        });
 
         // Start polling for login completion
         await waitForLoginCompletion(authSessionId, authPage, preAuthToken);
