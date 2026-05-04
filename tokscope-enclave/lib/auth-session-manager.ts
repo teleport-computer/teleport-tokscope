@@ -107,11 +107,62 @@ export class AuthSessionManager extends EventEmitter {
     return this.authSessions.get(authSessionId) || null;
   }
 
+  /**
+   * Apply partial updates to a session AND fire lifecycle events on
+   * detected transitions. Centralizing the emit logic here means the
+   * many `updateAuthSession` call sites in server.ts (~15 of them)
+   * don't each need their own emit boilerplate. Transitions detected:
+   *
+   *   - qrCodeData null/undefined → string  ⇒  emit 'qr_ready'
+   *   - status !== 'complete' → 'complete'  ⇒  emit 'auth_complete'
+   *   - status !== 'failed'   → 'failed'    ⇒  emit 'failed'
+   *
+   * Each transition fires exactly once even if updateAuthSession is
+   * called repeatedly with the same target state — the comparison is
+   * before/after, not absolute. Non-state-relevant updates (e.g.
+   * setting browser/page/containerId) emit nothing.
+   */
   updateAuthSession(authSessionId: string, updates: Partial<AuthSession>): void {
     const session = this.authSessions.get(authSessionId);
-    if (session) {
-      Object.assign(session, updates);
+    if (!session) return;
+
+    const wasQrReady = !!session.qrCodeData;
+    const oldStatus = session.status;
+
+    Object.assign(session, updates);
+
+    // qr_ready: fires the first time qrCodeData becomes truthy.
+    if (!wasQrReady && session.qrCodeData) {
+      this.emit('qr_ready', authSessionId, {
+        qrCodeData: session.qrCodeData,
+        qrDecodedUrl: session.qrDecodedUrl ?? null,
+      });
     }
+
+    // auth_complete: fires on the transition into 'complete'.
+    if (oldStatus !== 'complete' && session.status === 'complete') {
+      this.emit('auth_complete', authSessionId, {
+        secUserId: session.sessionData?.user?.sec_user_id ?? null,
+      });
+    }
+
+    // failed: fires on the transition into 'failed'.
+    if (oldStatus !== 'failed' && session.status === 'failed') {
+      this.emit('failed', authSessionId, { reason: 'auth failed' });
+    }
+  }
+
+  /**
+   * Emit a 'scan_detected' event for a session. Called by the
+   * scan-watcher when TikTok's "scanned, confirm on phone" indicator
+   * appears in the DOM. This is a UX/telemetry signal — it tells
+   * borgcube the user scanned but hasn't yet confirmed; the canonical
+   * auth-complete signal is the URL transition / cookie arrival,
+   * which fires `auth_complete` separately.
+   */
+  emitScanDetected(authSessionId: string): void {
+    if (!this.authSessions.has(authSessionId)) return;
+    this.emit('scan_detected', authSessionId, { timestamp: Date.now() });
   }
 
   removeAuthSession(authSessionId: string): void {
