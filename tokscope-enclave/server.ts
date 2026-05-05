@@ -9,7 +9,6 @@ import { tryAcquireInbound, releaseInbound } from './lib/inbound-semaphore';
 import { initDStack, getEncryptionKey, getDstackSDK } from './lib/tee-init';
 import { AuthSessionManager, AuthSession } from './lib/auth-session-manager';
 import { registerSseChannel } from './lib/sse-channel';
-import { attachScanWatcher } from './lib/scan-watcher';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -930,19 +929,15 @@ appAuth.post('/auth/start/:sessionId', async (req, res) => {
           await captureDebugScreenshot(authPage, authSessionId, 'qr_extraction_error');
         }
 
-        // v2.5 phase-3 step-3: attach the in-page scan-watcher so we
-        // get an early 'scan_detected' SSE event the moment TikTok
-        // renders its "scanned, confirm on phone" indicator. The
-        // watcher's selector candidates are placeholders; the real
-        // selector gets discovered during Phase 4 PROD2 iteration via
-        // debug-access DOM diff (see Scan-signal discovery section).
-        // If the watcher fails to attach OR the placeholders don't
-        // match the real DOM, auth still completes via URL detection
-        // inside waitForLoginCompletion — this is a UX/telemetry win,
-        // not a correctness gate.
-        await attachScanWatcher(authPage, () => {
-          authSessionManager!.emitScanDetected(authSessionId);
-        });
+        // v2.5.1.2 A3: scan-watcher removed. It was UX-only telemetry
+        // that fired 'scan_detected' via SSE between qr_ready and
+        // auth_complete; placeholder DOM selectors never matched
+        // TikTok's actual DOM in production, so the intermediate
+        // "scanned, confirming…" UX state never showed. Removed
+        // rather than ship debug-access endpoints + operator-driven
+        // selector discovery + ongoing TikTok-UI maintenance to fix
+        // it. Auth correctness unaffected — driven by URL transition
+        // + sessionid cookie arrival in waitForLoginCompletion below.
 
         // Start polling for login completion
         await waitForLoginCompletion(authSessionId, authPage, preAuthToken);
@@ -3166,10 +3161,9 @@ async function startServer(): Promise<void> {
 
     // v2.5 phase-3 step-1: register the SSE event-stream endpoint.
     // Subscribes to AuthSessionManager events for a given authSessionId
-    // and pushes them to the connected client. Today no auth-flow code
-    // emits qr_ready / scan_detected / auth_complete / failed yet —
-    // those wires get added in step 2. The endpoint is harmless until
-    // emits arrive (just streams nothing).
+    // and pushes them to the connected client. Auth-flow code emits
+    // qr_ready / auth_complete / failed (scan_detected was removed in
+    // v2.5.1.2 A3 — see authRelay.js header for the rationale).
     registerSseChannel(appAuth, authSessionManager);
 
     console.log('🔐 Auth session manager initialized');

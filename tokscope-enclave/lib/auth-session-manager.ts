@@ -5,8 +5,9 @@
 // Extracted in v2.5 phase 2 step 4 so the auth lifecycle state
 // machine can live alongside the SSE channel (Phase 3) — the SSE
 // endpoint will subscribe to events emitted by this class to stream
-// terminal-event updates (qr_ready, scan_detected, auth_complete,
-// failed) out to borgcube's authRelay.
+// terminal-event updates (qr_ready, auth_complete, failed) out to
+// borgcube's authRelay. (scan_detected was removed in v2.5.1.2 A3
+// — see authRelay.js header.)
 //
 // Dependency injection:
 //   - destroyContainer: callback to recycle the auth container when
@@ -19,7 +20,7 @@
 //   - 'session_removed' (authSessionId) — fires after removeAuthSession.
 //     server.ts listens to clean up auxiliary state (e.g.
 //     authScreenshotSteps Map).
-//   - Phase 3 adds: 'qr_ready', 'scan_detected', 'auth_complete', 'failed'.
+//   - Phase 3 adds: 'qr_ready', 'auth_complete', 'failed'.
 
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
@@ -150,19 +151,6 @@ export class AuthSessionManager extends EventEmitter {
     if (oldStatus !== 'failed' && session.status === 'failed') {
       this.emit('failed', authSessionId, { reason: 'auth failed' });
     }
-  }
-
-  /**
-   * Emit a 'scan_detected' event for a session. Called by the
-   * scan-watcher when TikTok's "scanned, confirm on phone" indicator
-   * appears in the DOM. This is a UX/telemetry signal — it tells
-   * borgcube the user scanned but hasn't yet confirmed; the canonical
-   * auth-complete signal is the URL transition / cookie arrival,
-   * which fires `auth_complete` separately.
-   */
-  emitScanDetected(authSessionId: string): void {
-    if (!this.authSessions.has(authSessionId)) return;
-    this.emit('scan_detected', authSessionId, { timestamp: Date.now() });
   }
 
   removeAuthSession(authSessionId: string): void {

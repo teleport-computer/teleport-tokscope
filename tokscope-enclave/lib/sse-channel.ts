@@ -6,9 +6,10 @@
 //
 // Event types streamed (each named SSE event):
 //   - qr_ready       payload: { qrCodeData, qrDecodedUrl }
-//   - scan_detected  payload: { timestamp }    (Phase 3 step 3 wires this)
 //   - auth_complete  payload: { secUserId? }
 //   - failed         payload: { reason }
+//
+// (scan_detected was removed in v2.5.1.2 A3 — see authRelay.js header.)
 //
 // Stream closes on terminal events (auth_complete or failed) or when
 // the client disconnects (req 'close' event). The matching emits live
@@ -23,7 +24,6 @@ import type { AuthSessionManager } from './auth-session-manager';
 
 type SseEventName =
   | 'qr_ready'
-  | 'scan_detected'
   | 'auth_complete'
   | 'failed';
 
@@ -126,7 +126,6 @@ export function registerSseChannel(
 
     const listeners: Array<[SseEventName, (...args: any[]) => void]> = [
       ['qr_ready', makeListener('qr_ready')],
-      ['scan_detected', makeListener('scan_detected')],
       ['auth_complete', makeListener('auth_complete')],
       ['failed', makeListener('failed')],
     ];
