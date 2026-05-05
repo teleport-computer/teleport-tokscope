@@ -3027,29 +3027,46 @@ appAuth.get('/debug/screenshots/:authSessionId', (req, res) => {
 });
 
 app.get('/health', async (req, res) => {
-  let bmHealthy = false;
-  let bmPool = 0;
-  try {
-    const bmResp = await fetch(`${BROWSER_MANAGER_URL}/stats`, {
-      signal: AbortSignal.timeout(3000)
-    });
-    if (bmResp.ok) {
-      const stats = await bmResp.json() as any;
-      bmHealthy = true;
-      bmPool = stats.poolSize || 0;
-    }
-  } catch {}
+  // v2.5: /health is mode-aware. Browser-manager only exists on
+  // CVMs that run auth flows (auth or legacy all-mode). Data-mode
+  // CVMs have no browser-manager service in their compose, no
+  // BROWSER_MANAGER_URL env, and shouldn't be marked degraded for
+  // its absence — that broke the data deploy in v2.5.1.1 (gateway
+  // 503'd the data CVM forever because /health returned status:
+  // degraded + 503 even though the TEE was fully initialized).
+  const requiresBrowserManager = isAuth || (!isDataCustomer && !isDataBulk);
 
-  const status = bmHealthy ? 'healthy' : 'degraded';
-  res.status(bmHealthy ? 200 : 503).json({
+  let bmHealthy = !requiresBrowserManager;  // implicitly OK when not required
+  let bmPool = 0;
+  if (requiresBrowserManager) {
+    try {
+      const bmResp = await fetch(`${BROWSER_MANAGER_URL}/stats`, {
+        signal: AbortSignal.timeout(3000)
+      });
+      if (bmResp.ok) {
+        const stats = await bmResp.json() as any;
+        bmHealthy = true;
+        bmPool = stats.poolSize || 0;
+      }
+    } catch {}
+  }
+
+  const dstackOk = !!getDstackSDK();
+  const encryptionOk = !!getEncryptionKey();
+  const healthy = bmHealthy && dstackOk && encryptionOk;
+  const status = healthy ? 'healthy' : 'degraded';
+
+  res.status(healthy ? 200 : 503).json({
     status,
-    browser_pool: bmHealthy ? bmPool : 0,
+    mode: MODE,
+    browser_pool: bmPool,
+    browser_manager_required: requiresBrowserManager,
     instance_id: process.env.INSTANCE_ID || 'main',
     uptime: (Date.now() - startTime) / 1000,
     sessions: sessionManager?.getSessionCount() || 0,
-    dstack: !!getDstackSDK(),
-    dstackInitialized: !!getDstackSDK(),
-    encryption: !!getEncryptionKey(),
+    dstack: dstackOk,
+    dstackInitialized: dstackOk,
+    encryption: encryptionOk,
     cookieEncryption: teeCrypto.isDStackKey() ? 'dstack' : 'fallback',
     watchHistoryEncryption: teeCrypto.isWatchHistoryKeyReady() ? 'dstack' : 'unavailable',
     timestamp: new Date().toISOString()
