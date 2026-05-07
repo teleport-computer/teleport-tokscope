@@ -2181,7 +2181,29 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
     if (req.body.encrypt_response && teeCrypto.isWatchHistoryKeyReady()) {
       // Pagination metadata always extracted (independent of dedup outcome).
       const hasMore = !!(responseData.has_more ?? responseData.hasMore);
-      const cursor = responseData.cursor || responseData.max_cursor || null;
+
+      // v2.6.1: cursor extraction mirrors the plaintext path's documented
+      // logic at DirectTikTokAPI.js:1450-1452 (comment: "CRITICAL: Use
+      // aweme_watch_history array's last timestamp"). The watch-history
+      // endpoint paginates backward in time; TikTok expects the OLDEST
+      // timestamp on the current page (= aweme_watch_history[last], since
+      // items are returned newest-first) as the next-page cursor. Sending
+      // responseData.cursor or responseData.max_cursor (the old behavior
+      // here, introduced in 1008be1 v1.1.8) made TikTok respond
+      // has_more=false after page 1, so every scrape exited at page 1.
+      const watchTimestamps: any[] = Array.isArray(responseData?.aweme_watch_history)
+        ? responseData.aweme_watch_history
+        : [];
+      let cursor: string | null = null;
+      if (watchTimestamps.length > 0) {
+        const lastTs = watchTimestamps[watchTimestamps.length - 1];
+        if (lastTs != null) cursor = String(lastTs);
+      }
+      if (!cursor) {
+        if (responseData.min_cursor != null) cursor = String(responseData.min_cursor);
+        else if (responseData.cursor != null) cursor = String(responseData.cursor);
+        else if (responseData.max_cursor != null) cursor = String(responseData.max_cursor);
+      }
 
       // ── v2.6.0: lean Shape B + HMAC write-time dedup ────────────────────
       // Extract only the fields we want to persist (video_id, watched_at,
@@ -2197,9 +2219,6 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       // behavior at the response-shape level.
 
       const awemeList: any[] = responseData?.aweme_list || responseData?.itemList || responseData?.videos || [];
-      const watchTimestamps: any[] = Array.isArray(responseData?.aweme_watch_history)
-        ? responseData.aweme_watch_history
-        : [];
       const rawEventsSeen = Array.isArray(awemeList) ? awemeList.length : 0;
 
       // existing_fingerprints: hex-encoded 16-byte HMAC fingerprints already
