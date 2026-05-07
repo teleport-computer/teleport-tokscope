@@ -3,15 +3,36 @@ import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
+import * as https from 'https';
 import jsQR from 'jsqr';
 import { log } from './lib/log';
-import { tryAcquireInbound, releaseInbound } from './lib/inbound-semaphore';
+import { tryAcquireInbound, releaseInbound, getInboundStats } from './lib/inbound-semaphore';
 import { initDStack, getEncryptionKey, getDstackSDK } from './lib/tee-init';
 import { AuthSessionManager, AuthSession } from './lib/auth-session-manager';
 import { registerSseChannel } from './lib/sse-channel';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+
+// v2.5.1.4: Shared HTTPS keep-alive agent for all xordi-api outbound calls.
+// Eliminates per-request TLS handshake overhead — especially material on the
+// bulk-side decrypt loop (1376 page-fetches per @zzhus decrypt).
+//
+// keepAliveMsecs=15000: 15s heartbeat. Customer cookie fetches arrive every
+//   5-15s; default 1s probes were noisy and let sockets churn between sporadic
+//   requests. Bulk hot loop is unaffected — sockets stay hot regardless.
+// timeout=60000: 60s socket-level idle. Verified Traefik upstream uses default
+//   idleTimeout=180s, so our 60s sits safely under. No ECONNRESET-on-reuse.
+// scheduling='lifo': re-use the most-recently-used socket → biases toward
+//   warm/working paths.
+const xordiAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15000,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000,
+  scheduling: 'lifo',
+});
 
 const BrowserAutomationClient = require('./lib/browser-automation-client');
 const WebApiClient = require('./lib/web-api-client');
@@ -1273,6 +1294,7 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
         install_id: sessionData.tokens?.install_id || sessionData.install_id
       },
       {
+        httpsAgent: xordiAgent,
         headers: {
           'X-Api-Key': xordiApiKey,
           'Content-Type': 'application/json'
@@ -1307,6 +1329,7 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
           skip_trust_update: isStaging  // Staging: complete flow without trust escalation
         },
         {
+          httpsAgent: xordiAgent,
           headers: {
             'X-Api-Key': xordiApiKey,
             'Content-Type': 'application/json'
@@ -1924,6 +1947,7 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
         const cookiesResponse = await axios.get(
           `${xordiApiUrl}/api/enclave/get-encrypted-cookies/${sec_user_id}`,
           {
+            httpsAgent: xordiAgent,  // v2.5.1.4: keep-alive shared agent
             headers: {
               'X-Api-Key': xordiApiKey
             },
@@ -2225,7 +2249,7 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
  * Called by borgcube when a 3P app requests watch history for an authorized user.
  * borgcube pre-authorizes the 3P app before proxying here.
  */
-appDataCustomer.post('/api/enclave/decrypt-watch-history', async (req, res) => {
+appDataBulk.post('/api/enclave/decrypt-watch-history', async (req, res) => {
   try {
     // Auth: same XORDI_API_KEY as /api/tiktok/execute
     const apiKey = req.header('X-Api-Key');
@@ -2264,6 +2288,7 @@ appDataCustomer.post('/api/enclave/decrypt-watch-history', async (req, res) => {
         request_id: audit_context.request_id,
         event_timestamp: new Date().toISOString(),
       }, {
+        httpsAgent: xordiAgent,
         headers: { 'X-Api-Key': (process.env.XORDI_API_KEY || '').split(',')[0] || '' },
         timeout: 5000,
       }).catch((err: any) => {
@@ -2285,7 +2310,7 @@ appDataCustomer.post('/api/enclave/decrypt-watch-history', async (req, res) => {
  * the TEE pulls them from borgcube using the manifest + page endpoints.
  * This avoids body size limits and reduces borgcube→TEE round-trips to one.
  */
-appDataCustomer.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
+appDataBulk.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
   try {
     // Auth
     const apiKey = req.header('X-Api-Key');
@@ -2314,7 +2339,7 @@ appDataCustomer.post('/api/enclave/decrypt-watch-history-v2', async (req, res) =
     // 30s absorbs xordi-api load variance; 10s was firing under contention.
     const manifestResp = await axios.get(
       `${xordiApiUrl}/api/enclave/get-encrypted-watch-history-manifest/${sec_user_id}`,
-      { headers: { 'X-Api-Key': xordiApiKey }, timeout: 30000 }
+      { httpsAgent: xordiAgent, headers: { 'X-Api-Key': xordiApiKey }, timeout: 30000 }
     );
 
     if (!manifestResp.data?.pages?.length) {
@@ -2337,7 +2362,7 @@ appDataCustomer.post('/api/enclave/decrypt-watch-history-v2', async (req, res) =
         batch.map((page: any) =>
           axios.get(
             `${xordiApiUrl}/api/enclave/get-encrypted-watch-history-page/${sec_user_id}/${page.id}`,
-            { headers: { 'X-Api-Key': xordiApiKey }, timeout: 30000 }
+            { httpsAgent: xordiAgent, headers: { 'X-Api-Key': xordiApiKey }, timeout: 30000 }
           )
         )
       );
@@ -2396,6 +2421,7 @@ appDataCustomer.post('/api/enclave/decrypt-watch-history-v2', async (req, res) =
         request_id: audit_context.request_id,
         event_timestamp: new Date().toISOString(),
       }, {
+        httpsAgent: xordiAgent,
         headers: { 'X-Api-Key': xordiApiKey },
         timeout: 5000,
       }).catch((err: any) => {
@@ -2504,7 +2530,7 @@ appDataBulk.post('/migrate/process-pending', async (req, res) => {
       // Get next batch of users (100 at a time)
       const pendingResponse = await axios.get(
         `${xordiApiUrl}/api/enclave/migrate/pending`,
-        { headers: { 'X-Api-Key': xordiApiKey } }
+        { httpsAgent: xordiAgent, headers: { 'X-Api-Key': xordiApiKey } }
       );
 
       const pendingUsers = pendingResponse.data.users || [];
@@ -2532,7 +2558,7 @@ appDataBulk.post('/migrate/process-pending', async (req, res) => {
               sec_user_id: user.sec_user_id,
               tee_encrypted_cookies: encryptedHex
             },
-            { headers: { 'X-Api-Key': xordiApiKey } }
+            { httpsAgent: xordiAgent, headers: { 'X-Api-Key': xordiApiKey } }
           );
 
           totalSuccess++;
@@ -2592,7 +2618,7 @@ appDataBulk.post('/migrate/verify-encryption', async (req, res) => {
     while (true) {
       const response = await axios.get(
         `${xordiApiUrl}/api/enclave/migrate/all-encrypted-users?offset=${offset}`,
-        { headers: { 'X-Api-Key': xordiApiKey } }
+        { httpsAgent: xordiAgent, headers: { 'X-Api-Key': xordiApiKey } }
       );
 
       const users = response.data.users || [];
@@ -2669,7 +2695,7 @@ appDataBulk.post('/migrate/upgrade-to-tee-key', async (req, res) => {
 
       const response = await axios.get(
         `${xordiApiUrl}/api/enclave/migrate/all-encrypted-users?offset=${offset}`,
-        { headers: { 'X-Api-Key': xordiApiKey } }
+        { httpsAgent: xordiAgent, headers: { 'X-Api-Key': xordiApiKey } }
       );
 
       const users = response.data.users || [];
@@ -2690,7 +2716,7 @@ appDataBulk.post('/migrate/upgrade-to-tee-key', async (req, res) => {
             await axios.post(
               `${xordiApiUrl}/api/enclave/migrate/complete`,
               { sec_user_id: user.sec_user_id, tee_encrypted_cookies: reEncryptedHex },
-              { headers: { 'X-Api-Key': xordiApiKey } }
+              { httpsAgent: xordiAgent, headers: { 'X-Api-Key': xordiApiKey } }
             );
 
             reEncrypted++;
@@ -3051,9 +3077,14 @@ app.get('/health', async (req, res) => {
   const healthy = bmHealthy && dstackOk && encryptionOk;
   const status = healthy ? 'healthy' : 'degraded';
 
+  // v2.5.1.4: expose inbound concurrency state for capacity diagnostics
+  const inboundStats = getInboundStats();
+
   res.status(healthy ? 200 : 503).json({
     status,
     mode: MODE,
+    inflight: inboundStats.inflight,
+    inflight_limit: inboundStats.limit,
     browser_pool: bmPool,
     browser_manager_required: requiresBrowserManager,
     instance_id: process.env.INSTANCE_ID || 'main',
