@@ -8,15 +8,23 @@
 // load-bearing invariant for the auth-CVM / data-CVM cookie-sharing
 // pattern (see Appendix A in RELEASE-v2.5.md).
 //
-// Three keys derive deterministically per (app_id, key_purpose) from
+// Four keys derive deterministically per (app_id, key_purpose) from
 // DStack KMS:
-//   - 'session-encryption' → encryptionKey (used by upload/load-session)
-//   - 'cookie-encryption'  → cookie key (held inside teeCrypto module)
-//   - 'watch-history-encryption' → watch-history key (held inside teeCrypto)
+//   - 'session-encryption'        → encryptionKey (used by upload/load-session)
+//   - 'cookie-encryption'         → cookie key (held inside teeCrypto module)
+//   - 'watch-history-encryption'  → watch-history key (held inside teeCrypto)
+//   - 'watch-history-dedup'       → HMAC key for write-time event dedup (v2.6.0).
+//                                    Returned as raw 32 bytes; HMAC algorithm
+//                                    selection is done locally via
+//                                    crypto.createHmac. DStack's getKey(path,
+//                                    purpose) takes two domain strings, NOT an
+//                                    algorithm selector — domain separation
+//                                    comes from the path string only.
 //
 // Module-scoped state: dstackSDK (the client) + encryptionKey (used by
-// session helpers in server.ts). Getters expose them to callers so
-// server.ts doesn't have to share variable references with the lib.
+// session helpers in server.ts) + dedupHmacKey (used by /api/tiktok/execute
+// to dedup events at write time). Getters expose them so server.ts doesn't
+// have to share variable references with the lib.
 
 import * as crypto from 'crypto';
 const teeCrypto = require('../tee-crypto.js');
@@ -24,6 +32,7 @@ import { log } from './log';
 
 let dstackSDK: any = null;
 let encryptionKey: Buffer | null = null;
+let dedupHmacKey: Buffer | null = null;
 
 /**
  * Initialize DStack-derived keys + crypto worker pool. Idempotent: if
@@ -55,6 +64,13 @@ export async function initDStack(): Promise<void> {
     const watchHistoryKey = Buffer.from(watchHistoryKeyResult.key).slice(0, 32);
     teeCrypto.setDStackWatchHistoryKey(watchHistoryKey);
 
+    // v2.6.0: HMAC key for watch-history write-time dedup. Independent path
+    // from the AES encryption key — DStack guarantees domain-separated paths
+    // produce uncorrelated keys. Stored at module scope; consumed by
+    // server.ts /api/tiktok/execute to compute per-event fingerprints.
+    const dedupKeyResult = await client.getKey('watch-history-dedup', '');
+    dedupHmacKey = Buffer.from(dedupKeyResult.key).slice(0, 32);
+
     // v1.1.9: block until the crypto worker pool has acknowledged the key.
     // This guarantees the HTTP server never answers a request before the
     // pool is ready — no race between startup and first scrape.
@@ -63,11 +79,16 @@ export async function initDStack(): Promise<void> {
     // Keep reference for /health endpoint
     dstackSDK = client;
 
-    console.log('✅ DStack initialized, using TEE-derived keys for sessions + cookies + watch-history');
+    console.log('✅ DStack initialized, using TEE-derived keys for sessions + cookies + watch-history + dedup-hmac');
   } catch (error: any) {
     console.log('⚠️ DStack unavailable, using fallback encryption keys:', error.message);
     const seed = 'tcb-session-encryption-fallback-seed-12345';
     encryptionKey = crypto.createHash('sha256').update(seed).digest();
+    // v2.6.0: dev fallback for dedup HMAC key. Never used in prod (DStack
+    // succeeds in prod). Different seed than encryption key to keep the
+    // domain separation property intact even in dev.
+    const dedupSeed = 'tcb-watch-history-dedup-fallback-seed-12345';
+    dedupHmacKey = crypto.createHash('sha256').update(dedupSeed).digest();
     // tee-crypto.js keeps its constructor fallback key
   }
 }
@@ -89,4 +110,33 @@ export function getEncryptionKey(): Buffer | null {
  */
 export function getDstackSDK(): any {
   return dstackSDK;
+}
+
+/**
+ * v2.6.0: Returns the HMAC key for watch-history write-time dedup
+ * (32-byte Buffer) once initDStack has run. Throws if init hasn't run
+ * — callers (server.ts /api/tiktok/execute) MUST be downstream of init.
+ *
+ * Used to compute per-event fingerprints:
+ *   fingerprint = HMAC-SHA256(dedupHmacKey, sec_user_id || '|' ||
+ *                              video_id || '|' || watched_at_seconds)[:16]
+ *
+ * Domain separation from the AES encryption key is enforced by DStack
+ * (different paths → uncorrelated keys). HMAC algorithm choice happens
+ * at the call site via crypto.createHmac('sha256', key).
+ */
+export function getDedupHmacKey(): Buffer {
+  if (!dedupHmacKey) {
+    throw new Error('Dedup HMAC key not initialized; initDStack() must complete first');
+  }
+  return dedupHmacKey;
+}
+
+/**
+ * v2.6.0: Returns true once the dedup HMAC key has been derived. Used
+ * by /health to surface the dedup-key state alongside the other crypto
+ * readiness flags.
+ */
+export function isDedupHmacKeyReady(): boolean {
+  return dedupHmacKey !== null;
 }

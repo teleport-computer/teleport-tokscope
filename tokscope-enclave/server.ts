@@ -7,7 +7,7 @@ import * as https from 'https';
 import jsQR from 'jsqr';
 import { log } from './lib/log';
 import { tryAcquireInbound, releaseInbound, getInboundStats } from './lib/inbound-semaphore';
-import { initDStack, getEncryptionKey, getDstackSDK } from './lib/tee-init';
+import { initDStack, getEncryptionKey, getDstackSDK, getDedupHmacKey, isDedupHmacKeyReady } from './lib/tee-init';
 import { AuthSessionManager, AuthSession } from './lib/auth-session-manager';
 import { registerSseChannel } from './lib/sse-channel';
 import { Jimp } from 'jimp';
@@ -2177,26 +2177,124 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       });
     }
 
-    // 8. Return response — optionally encrypt if requested (v1.1.8)
+    // 8. Return response — optionally encrypt if requested (v1.1.8, rewritten v2.6.0)
     if (req.body.encrypt_response && teeCrypto.isWatchHistoryKeyReady()) {
-      // Extract pagination metadata BEFORE encrypting (borgcube needs these for scrape loop)
+      // Pagination metadata always extracted (independent of dedup outcome).
       const hasMore = !!(responseData.has_more ?? responseData.hasMore);
       const cursor = responseData.cursor || responseData.max_cursor || null;
-      // Encrypt the full response (video data + everything).
-      // v1.1.9: async — delegated to worker_threads pool.
-      const encryptedHex = await teeCrypto.encryptWatchHistory(responseData);
-      // v1.2.1.1.4: include per-page video count as non-encrypted metadata so the
-      // orchestrator can populate watch_history_sessions.unique_videos accurately.
-      // v1.2.1.1.5: TikTok responses use multiple field names depending on endpoint
-      // (aweme_list / itemList / videos). Match crypto-worker.js:91 fallback chain
-      // — checking only aweme_list missed the data in many real responses.
-      const videoArr = responseData?.aweme_list || responseData?.itemList || responseData?.videos;
-      const videosCount = Array.isArray(videoArr) ? videoArr.length : 0;
+
+      // ── v2.6.0: lean Shape B + HMAC write-time dedup ────────────────────
+      // Extract only the fields we want to persist (video_id, watched_at,
+      // desc, hashtags), compute per-event fingerprints, filter against the
+      // user's existing fingerprint set (passed in by borgcube), and
+      // encrypt only the genuinely-new events.
+      //
+      // BACKWARD COMPATIBILITY: response fields { encrypted, has_more,
+      // cursor, videos_count } stay; new fields { new_fingerprints,
+      // new_events, raw_events_seen } are additive. Old callers not
+      // sending `existing_fingerprints` get every event treated as new
+      // (empty existingSet → no filtering). Identical to pre-v2.6.0
+      // behavior at the response-shape level.
+
+      const awemeList: any[] = responseData?.aweme_list || responseData?.itemList || responseData?.videos || [];
+      const watchTimestamps: any[] = Array.isArray(responseData?.aweme_watch_history)
+        ? responseData.aweme_watch_history
+        : [];
+      const rawEventsSeen = Array.isArray(awemeList) ? awemeList.length : 0;
+
+      // existing_fingerprints: hex-encoded 16-byte HMAC fingerprints already
+      // stored for this user. Borgcube pre-fetches via SELECT … FROM
+      // watch_history_dedup. Empty array (or missing) means dedup-pass-through.
+      const existingFingerprintsHex: string[] = Array.isArray(req.body?.existing_fingerprints)
+        ? req.body.existing_fingerprints
+        : [];
+      const existingSet = new Set<string>(existingFingerprintsHex);
+
+      // Compute fingerprints + extract lean shape only if dedup key is ready.
+      // In dev without DStack (and without seed fallback firing), key may be
+      // missing → fall through to a no-dedup behavior identical to pre-v2.6.0.
+      const dedupKeyReady = isDedupHmacKeyReady();
+      const dedupKey = dedupKeyReady ? getDedupHmacKey() : null;
+
+      const newEvents: any[] = [];
+      const newFingerprintsHex: string[] = [];
+
+      if (Array.isArray(awemeList)) {
+        for (let i = 0; i < awemeList.length; i++) {
+          const aweme = awemeList[i];
+          const videoId = String(aweme?.aweme_id || aweme?.video_id || aweme?.id || '');
+          if (!videoId) continue;
+
+          // watched_at: parallel array of ms-string timestamps. Skip events
+          // missing a timestamp — they break dedup (no key) and aren't useful
+          // analytically.
+          const tsRaw = watchTimestamps[i];
+          const tsMs = tsRaw != null ? parseInt(String(tsRaw), 10) : NaN;
+          if (!Number.isFinite(tsMs) || tsMs <= 0) continue;
+          const watchedAtIso = new Date(tsMs).toISOString();
+
+          // Fingerprint at second precision (TikTok occasionally returns slight
+          // ms drift across scrapes for the same event; second bucket is the
+          // minimum granularity that's stable while preserving genuinely-distinct
+          // rewatches at different times).
+          let fpHex: string | null = null;
+          if (dedupKey) {
+            const watchedAtSec = Math.floor(tsMs / 1000);
+            const fpBuf = crypto.createHmac('sha256', dedupKey)
+              .update(`${sec_user_id}|${videoId}|${watchedAtSec}`, 'utf8')
+              .digest()
+              .subarray(0, 16);
+            fpHex = fpBuf.toString('hex');
+            if (existingSet.has(fpHex)) continue;
+            existingSet.add(fpHex);
+          }
+
+          // Lean Shape B fields. Use `desc` (not `description`) so existing
+          // borgcube watchHistoryDecryptor.transformVideo's `video.desc`
+          // lookup keeps working without code change. Pre-extract hashtags
+          // because lean shape doesn't include text_extra (which contains
+          // structured-only hashtags not in desc inline).
+          const descStr = String(aweme?.desc || '');
+          const hashtagSet = new Set<string>();
+          const inlineMatches = descStr.match(/#\w+/g);
+          if (inlineMatches) {
+            for (const m of inlineMatches) hashtagSet.add(m.slice(1));
+          }
+          if (Array.isArray(aweme?.text_extra)) {
+            for (const te of aweme.text_extra) {
+              if (te?.hashtag_name) hashtagSet.add(te.hashtag_name);
+            }
+          }
+
+          newEvents.push({
+            video_id: videoId,
+            watched_at: watchedAtIso,
+            desc: descStr,
+            hashtags: Array.from(hashtagSet),
+          });
+          if (fpHex) newFingerprintsHex.push(fpHex);
+        }
+      }
+
+      // Encrypt only if there's anything new. encrypted=null means "all events
+      // were duplicates; nothing to write." Borgcube's existing
+      // `if (responseData.encrypted)` truthy check at DirectTikTokAPI.js:1289
+      // handles this gracefully (skips push to _encryptedPages).
+      let encryptedHex: string | null = null;
+      if (newEvents.length > 0) {
+        encryptedHex = await teeCrypto.encryptWatchHistory({ videos: newEvents });
+      }
+
       return res.json({
+        // ── Existing fields (backward compat) ──
         encrypted: encryptedHex,
         has_more: hasMore,
         cursor: cursor,
-        videos_count: videosCount,
+        videos_count: newEvents.length,
+        // ── New fields (v2.6.0; additive, ignored by old callers) ──
+        new_fingerprints: newFingerprintsHex,
+        new_events: newEvents.length,
+        raw_events_seen: rawEventsSeen,
       });
     } else if (req.body.encrypt_response && !teeCrypto.isWatchHistoryKeyReady()) {
       // encrypt_response requested but DStack key not available
