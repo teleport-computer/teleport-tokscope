@@ -34,6 +34,67 @@ const xordiAgent = new https.Agent({
   scheduling: 'lifo',
 });
 
+// v2.7.x — Per-bucket SOCKS5 agent pool for outbound TikTok requests.
+//
+// Pre-fix the /api/tiktok/execute handler constructed a fresh SocksProxyAgent
+// on every call (see :2114 IPFoxy + the WireGuard path below). At ~1500
+// scrapes/hr that's ~25 throwaway agents/min on data-customer, each with its
+// own EventEmitter + sockets Map + per-request SOCKS5 + TLS handshake. The
+// allocation churn compounded into V8 GC pauses long enough to fail the 3s
+// /health check; tunnel sockets also survived axios's 15s timeout because
+// per-request agents that go out of scope don't reliably destroy their open
+// sockets (libuv keeps the C++ side alive without an explicit destroy()).
+// docs/2026-04-30-WG-BUCKET-DEGRADATION-AUTH-FAILURES.md observed those
+// orphans as a 4.8KB-then-520s-idle pattern in wg-bucket logs.
+//
+// data-bulk never instantiates SocksProxyAgent (decrypt-only routes; no
+// outbound TikTok), which is why the wedge is customer-only.
+//
+// IPFoxy mode stays per-request: its SOCKS5 username encodes a per-user
+// session token, and pooling would break IP-rotation stickiness.
+const wgSocksAgents = new Map<number, SocksProxyAgent>();
+
+function getWgSocksAgent(bucket: number): SocksProxyAgent {
+  const cached = wgSocksAgents.get(bucket);
+  if (cached) return cached;
+
+  const wgHost = process.env.WIREGUARD_HOST || '162.251.235.136';
+  const wgBasePort = parseInt(process.env.WIREGUARD_BASE_PORT || '10800', 10);
+  const wgUser = process.env.WG_PROXY_USER;
+  const wgPass = process.env.WG_PROXY_PASS;
+  if (!wgUser || !wgPass) {
+    throw new Error('WG_PROXY_USER/WG_PROXY_PASS not configured');
+  }
+  const socksProxy = `socks5://${wgUser}:${wgPass}@${wgHost}:${wgBasePort + bucket}`;
+
+  // Sizing rationale (verified against socks-proxy-agent@8.0.5 +
+  // agent-base@7.1.4 source — agent-base bridges connect() into the standard
+  // http.Agent pool, so keepAlive/maxSockets/keepAliveMsecs are honored
+  // natively for HTTPS-through-SOCKS5):
+  //
+  // - maxSockets=20 per bucket × 10 buckets = 200-socket ceiling on outbound
+  //   TikTok TCP. Far above TEE_INBOUND_CONCURRENCY_LIMIT=12 (the real
+  //   upstream cap) so this never throttles in practice.
+  // - maxFreeSockets=5: warm pool kept per bucket.
+  // - keepAliveMsecs=15000: TCP keep-alive probe interval. Matches xordiAgent.
+  // - scheduling='lifo': reuse most-recently-used socket. Matches xordiAgent.
+  // - NO `timeout` option: socks-proxy-agent's connect() installs a permanent
+  //   inactivity setTimeout on the raw TCP socket when this is set (see
+  //   socks-proxy-agent/dist/index.js:138-141). That timer survives pool
+  //   reuse and destroys pooled sockets after N ms of pool idle, breaking
+  //   keep-alive efficiency. http.Agent's own pool eviction is sufficient.
+  const agent = new SocksProxyAgent(socksProxy, {
+    keepAlive: true,
+    keepAliveMsecs: 15000,
+    maxSockets: 20,
+    maxFreeSockets: 5,
+    scheduling: 'lifo',
+  });
+  wgSocksAgents.set(bucket, agent);
+  log.ok('TEE', 'wg_socks_agent_created', { bucket });
+  return agent;
+}
+
 const BrowserAutomationClient = require('./lib/browser-automation-client');
 const WebApiClient = require('./lib/web-api-client');
 const { PublicApiClient } = require('./lib/public-api-client');
@@ -2114,20 +2175,16 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       proxyAgent = new SocksProxyAgent(socksProxy);
 
     } else if (proxyMode === 'wireguard' && wireguard_bucket !== null && wireguard_bucket !== undefined) {
-      // WireGuard buckets run on borgcube, connect via external SOCKS5
-      const wgHost = process.env.WIREGUARD_HOST || '162.251.235.136';
-      const wgBasePort = parseInt(process.env.WIREGUARD_BASE_PORT || '10800');
-      const wgUser = process.env.WG_PROXY_USER;
-      const wgPass = process.env.WG_PROXY_PASS;
-
-      if (!wgUser || !wgPass) {
-        console.error('❌ WG_PROXY_USER/WG_PROXY_PASS not configured');
+      // v2.7.x — reuse the per-bucket pooled agent (see getWgSocksAgent comment
+      // at top of file for full rationale). Pre-fix this constructed a fresh
+      // SocksProxyAgent every call, which was the root cause of the recurring
+      // data-customer wedge.
+      try {
+        proxyAgent = getWgSocksAgent(wireguard_bucket);
+      } catch (err: any) {
+        console.error('❌ WG agent init failed:', err.message);
         return res.status(500).json({ error: 'WireGuard credentials not configured' });
       }
-
-      const port = wgBasePort + wireguard_bucket;
-      const socksProxy = `socks5://${wgUser}:${wgPass}@${wgHost}:${port}`;
-      proxyAgent = new SocksProxyAgent(socksProxy);
 
     } else {
       // Direct connection (no proxy)
